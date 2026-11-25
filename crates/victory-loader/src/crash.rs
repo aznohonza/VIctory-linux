@@ -882,8 +882,21 @@ mod tests {
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
+    /// Whether we run under Wine (its ntdll exports `wine_get_version`).
+    fn on_wine() -> bool {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: looks a name up in a module every process has loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    }
+
     #[test]
     fn concurrent_crash_records_stay_together() {
+        if on_wine() {
+            return; // Wine's appends from two threads at once can interleave
+        }
         const THREADS: usize = 8;
         const RECORDS: usize = 16;
         let dir = tempfile::tempdir().unwrap();
