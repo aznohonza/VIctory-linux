@@ -1093,7 +1093,12 @@ enum Step {
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
-    Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    Refresh(
+        std::sync::Arc<crate::shadow::Shadow>,
+        usize,
+        usize,
+        crate::shadow::Path,
+    ),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -2281,13 +2286,14 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        path: crate::shadow::Path,
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+                .push(Step::Refresh(shadow.clone(), address, len, path));
         }
     }
 
@@ -2572,13 +2578,13 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
-                Step::Refresh(shadow, address, len) => {
+                Step::Refresh(shadow, address, len, path) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    batch.add(shadow, *address, *len);
+                    batch.add(shadow, *address, *len, *path);
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -2605,11 +2611,15 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    crate::bindless::refresh(viewed, |s, a, l| {
+                        batch.add(s, a, l, crate::shadow::Path::Bindless)
+                    });
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    crate::memory::prepare(heap, |s, a, l| {
+                        batch.add(s, a, l, crate::shadow::Path::HeapPages)
+                    });
                     continue;
                 }
             };
@@ -2635,7 +2645,8 @@ impl HostList {
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Each with the paths that asked for it (a bit per `copystat::Path`).
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u8)>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
     /// The range of each copy brought up to date since the last title
@@ -2645,7 +2656,13 @@ struct Batch {
 }
 
 impl Batch {
-    fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    fn add(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        path: crate::shadow::Path,
+    ) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
@@ -2661,12 +2678,14 @@ impl Batch {
         }
         match self.pending.get(&key) {
             Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
+                let (_, from, to, paths) = &mut self.refreshes[i];
                 (*from, *to) = ((*from).min(address), (*to).max(end));
+                *paths |= 1 << path as u8;
             }
             None => {
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes
+                    .push((shadow.clone(), address, end, 1 << path as u8));
             }
         }
     }
@@ -2684,10 +2703,19 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        for (shadow, from, to, paths) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::by_path(
+                paths,
+                (to - from) as u64,
+                copied as u64,
+                crate::shadow::take_grain(),
+            );
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = paths;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -4365,7 +4393,7 @@ mod withholding {
         for &(k, at, len, memory, value) in &writes {
             let _writer = list.writer_uses_memory(memory);
             let (copy, address) = (copies[k].clone(), (pools[k] + at) as u64);
-            copy.refresh(&list, address, len);
+            copy.refresh(&list, address, len, crate::shadow::Path::Root);
             copy.gpu_writes(&list, address, len, false);
             // The shader's write, after the step that keeps the range's bytes.
             list.defer_host(move || copy.write_host(address, &[value]));

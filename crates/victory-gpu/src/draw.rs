@@ -219,7 +219,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         .min(if srv || uav { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || uav || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
+        shadow.refresh(list, address, len, crate::shadow::Path::Root);
         if uav {
             // A host root descriptor: no heap view, so its writes are not
             // marked.
@@ -560,7 +560,12 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 continue;
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.refresh(
+                list,
+                v.address,
+                u64::from(v.size),
+                crate::shadow::Path::Vertex,
+            );
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -579,7 +584,12 @@ impl State {
                 not_run("index buffer outside title buffers");
                 return false;
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.refresh(
+                list,
+                v.address,
+                u64::from(v.size),
+                crate::shadow::Path::Index,
+            );
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -886,7 +896,7 @@ impl State {
                 for (address, shadow) in &roots {
                     if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
                         let len = shadow.left(*address).min(1 << 20);
-                        shadow.refresh(list, *address, len);
+                        shadow.refresh(list, *address, len, crate::shadow::Path::Memory);
                         shadow.gpu_writes(list, *address, len, false);
                         map.precise(*address, len);
                     }
@@ -953,7 +963,7 @@ impl State {
         } else {
             (address, shadow.left(address))
         };
-        shadow.refresh(list, refresh_at, refresh_len);
+        shadow.refresh(list, refresh_at, refresh_len, crate::shadow::Path::Root);
         if uav {
             // Writes through the view are marked wherever they land in the
             // copy; else declared for 1 MiB.
@@ -1861,9 +1871,9 @@ impl State {
             why("no host signature");
             return false;
         };
-        args.refresh(list, arguments, len);
+        args.refresh(list, arguments, len, crate::shadow::Path::Indirect);
         if let Some((s, at)) = &counter {
-            s.refresh(list, *at, 4);
+            s.refresh(list, *at, 4, crate::shadow::Path::Indirect);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max))
@@ -2024,7 +2034,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         } else {
             (address, len)
         };
-        shadow.refresh(list, refresh_at, refresh_len);
+        shadow.refresh(list, refresh_at, refresh_len, crate::shadow::Path::Table);
         if uav {
             shadow.gpu_writes(list, address, len, marked);
         }

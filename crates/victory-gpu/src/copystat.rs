@@ -122,6 +122,67 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
+const PATHS: [&str; 8] = [
+    "root",
+    "vertex",
+    "index",
+    "memory",
+    "indirect",
+    "table",
+    "bindless",
+    "heap pages",
+];
+
+/// Per set of paths (a bit each) that asked for one copy's refresh:
+/// bytes checked, bytes copied, and bytes in 4 KiB pages that differed.
+#[cfg(feature = "diagnostics")]
+static BY_PATH: Mutex<Option<HashMap<u8, (u64, u64, u64)>>> = Mutex::new(None);
+
+/// A refresh asked for by `paths` checked `checked` bytes and copied
+/// `copied`, of which `grain` were in 4 KiB pages that differed.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn by_path(paths: u8, checked: u64, copied: u64, grain: u64) {
+    let mut map = BY_PATH.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map
+        .get_or_insert_with(HashMap::new)
+        .entry(paths)
+        .or_default();
+    e.0 += checked;
+    e.1 += copied;
+    e.2 += grain;
+}
+
+/// Whether copies also count the 4 KiB pages that differ
+/// (`VICTORY_COPY_GRAIN=1`; diagnostics, it compares every copied byte).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn grain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_GRAIN").is_some_and(|v| v == "1"))
+}
+
+/// The refreshes by path since the last line, per frame, largest copied first.
+#[cfg(feature = "diagnostics")]
+fn log_paths(frames: f64) {
+    let Some(map) = BY_PATH.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut rows: Vec<_> = map.into_iter().collect();
+    rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.1.1));
+    for (paths, (checked, copied, grain)) in rows.into_iter().take(8) {
+        let names: Vec<&str> = (0..PATHS.len())
+            .filter(|i| paths & 1 << i != 0)
+            .map(|i| PATHS[i])
+            .collect();
+        tracing::info!(
+            "  refreshed for {}: {:.1} MB checked, {:.1} MB copied, {:.1} MB in changed 4 KiB pages",
+            names.join("+"),
+            checked as f64 / frames / 1e6,
+            copied as f64 / frames / 1e6,
+            grain as f64 / frames / 1e6,
+        );
+    }
+}
+
 /// Per source range (start, length): copies, bytes, microseconds, memory type.
 type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
@@ -305,6 +366,7 @@ pub(crate) fn log(frames: f64) {
         working_set() as f64 / 1e6,
         {
             static HARD: AtomicU64 = AtomicU64::new(0);
+            log_paths(frames);
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },

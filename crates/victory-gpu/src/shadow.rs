@@ -63,6 +63,26 @@ fn writeback_merge_matches_bytewise_oracle() {
     }
 }
 
+/// What asked for a refresh of title memory: the draw or dispatch state
+/// that reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Path {
+    /// A root view (descriptor) of a draw or dispatch.
+    Root = 0,
+    Vertex = 1,
+    Index = 2,
+    /// Memory a shader reads through the page table (title addresses).
+    Memory = 3,
+    /// Arguments of an indirect draw or dispatch.
+    Indirect = 4,
+    /// A view in a descriptor table (heap).
+    Table = 5,
+    /// A buffer read through a directly indexed heap (bindless).
+    Bindless = 6,
+    /// Pages of title memory a heap's views reach (`crate::memory`).
+    HeapPages = 7,
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -238,9 +258,9 @@ impl Shadow {
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
-    pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64, path: Path) {
         let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        list.defer_refresh(self, address as usize, len as usize, path);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
@@ -670,6 +690,10 @@ impl Shadow {
         };
         let mut copied = 0;
         for (a, b) in runs {
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::grain() {
+                GRAIN.with(|g| g.set(g.get() + self.differing_pages(a, b)));
+            }
             copied += self.copy(a, b);
             sync_before(a, b);
         }
@@ -701,6 +725,30 @@ impl Shadow {
             add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
         }
         copied
+    }
+
+    /// Bytes of `[from, to)` (inside the buffer) in 4 KiB pages where the
+    /// title's memory differs from the copy (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn differing_pages(&self, from: usize, to: usize) -> u64 {
+        let mut bytes = 0;
+        let mut at = from;
+        while at < to {
+            let end = ((at & !0xfff) + 0x1000).min(to);
+            // SAFETY: title memory the copy below reads, and the copy's
+            // mapping at the same offset.
+            let (title, host) = unsafe {
+                (
+                    std::slice::from_raw_parts(at as *const u8, end - at),
+                    std::slice::from_raw_parts(self.data.add(at - self.start as usize), end - at),
+                )
+            };
+            if title != host {
+                bytes += (end - at) as u64;
+            }
+            at = end;
+        }
+        bytes
     }
 
     /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
@@ -846,6 +894,19 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
             })
         })
         .as_ref()
+}
+
+// Bytes in changed 4 KiB pages counted by this thread's last updates
+// (`crate::copystat::grain`), taken by [`take_grain`].
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static GRAIN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The bytes counted since the last call (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_grain() -> u64 {
+    GRAIN.with(|g| g.replace(0))
 }
 
 /// The host GPU address of the buffer views' written-pages bitmap, for the
