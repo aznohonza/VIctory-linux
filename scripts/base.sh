@@ -25,18 +25,29 @@ case "$name" in
 esac
 
 src="${XDG_CACHE_HOME:-$HOME/.cache}/victory/bases/$name-${commit:0:12}"
-if [[ ! -f "$src/.prepared" ]]; then
-    echo "base.sh: fetching $name at ${commit:0:12}" >&2
-    rm -rf "${src:?}"
-    mkdir -p "$src"
-    git -C "$src" init -q
-    git -C "$src" fetch -q --depth 1 "$repo" "$commit"
-    git -C "$src" checkout -q FETCH_HEAD
-    shopt -s nullglob
-    for patch in "$ROOT/scripts/bases/$name"/*.patch; do
+shopt -s nullglob
+patches=("$ROOT/scripts/bases/$name"/*.patch)
+# The patches applied, by content: a changed or new one is applied again
+# over a clean checkout (the build directory stays).
+want="$(cat /dev/null "${patches[@]}" | sha256sum | cut -d' ' -f1)"
+if [[ "$(cat "$src/.prepared" 2>/dev/null)" != "$want" ]]; then
+    if [[ ! -d "$src/.git" ]]; then
+        echo "base.sh: fetching $name at ${commit:0:12}" >&2
+        rm -rf "${src:?}"
+        mkdir -p "$src"
+        git -C "$src" init -q
+        git -C "$src" fetch -q --depth 1 "$repo" "$commit"
+        git -C "$src" checkout -q FETCH_HEAD
+    else
+        echo "base.sh: applying $name's patches again" >&2
+        git -C "$src" reset -q --hard
+        git -C "$src" clean -fdq -e /target -e /.prepared
+    fi
+    for patch in "${patches[@]}"; do
         git -C "$src" apply "$patch"
     done
-    touch "$src/.prepared"
+    echo "$want" >"$src/.prepared"
+    rm -f "$src/target/x86_64-pc-windows-msvc/release/victory.exe"
 fi
 
 exe="$src/target/x86_64-pc-windows-msvc/release/victory.exe"
