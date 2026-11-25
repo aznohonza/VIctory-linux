@@ -493,12 +493,11 @@ struct MemoryEntry {
 
 /// Whether a lane mask joined with data where every lane enters along one
 /// edge lowers to the mask's number (upstream e8e9f0c, the title's BVH
-/// walks). Off on Linux: vkd3d-proton's DXIL to SPIR-V translation
-/// (dxil-spirv, in Proton Experimental 11.0-20261112) recurses without end
-/// on the programs it makes translatable, and the stack overflow ends the
-/// pipeline thread, so pipelines stop being made. The joins stay refused, as
-/// before e8e9f0c.
-pub(super) const MASK_NUMBERS_AT_UNIFORM_JOINS: bool = false;
+/// walks). The dxil-spirv of Proton Experimental 11.0-20261112 recurses
+/// without end on the programs this makes translatable, which ends the thread
+/// making pipelines: on Linux, they need vkd3d-proton master
+/// (`scripts/vkd3d-proton-master.sh`), whose dxil-spirv does not.
+pub(super) const MASK_NUMBERS_AT_UNIFORM_JOINS: bool = true;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaskData {
