@@ -4335,22 +4335,22 @@ mod batch {
             return; // no host GPU here
         };
         let mut batch = Batch::default();
-        batch.add(&copy, p, len);
+        batch.add(&copy, p, len, crate::shadow::Path::Root);
         assert_eq!(batch.flush(), len, "all of it at first");
         // SAFETY: our pool, guarded since the copy took it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(7) };
         // The next submission: two lists ask for the copy.
         let mut batch = Batch::default();
-        batch.add(&copy, p, len);
-        batch.add(&copy, p + 100, 200);
+        batch.add(&copy, p, len, crate::shadow::Path::Root);
+        batch.add(&copy, p + 100, 200, crate::shadow::Path::Root);
         assert_eq!(batch.flush(), PAGE, "the page written");
         assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
         // SAFETY: as above.
         unsafe { (p as *mut u8).write_volatile(1) };
-        batch.add(&copy, p, len);
+        batch.add(&copy, p, len, crate::shadow::Path::Root);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
         batch.title_written();
-        batch.add(&copy, p, len);
+        batch.add(&copy, p, len, crate::shadow::Path::Root);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
