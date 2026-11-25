@@ -57,18 +57,22 @@ with `scripts/proton-run.sh`.
 
 | Card | Build (`VICTORY_BUILD`) | Source |
 |---|---|---|
-| AMD | `klbf-lab` | PastiiJay/klbf-lab, first on AMD in the community's rankings |
+| AMD | `victory-7900xtx` | avatarmanz/VIctory-7900XTX, first on AMD in the community's rankings |
 | NVIDIA | `victory-fork` | fxceless/victory-fork, the reference build for NVIDIA |
 | Other | `victory` | this checkout |
 
-`scripts/base.sh` fetches the first two at a fixed commit into
+`klbf-lab` (PastiiJay/klbf-lab), the AMD build before it, stays available
+by name.
+
+`scripts/base.sh` fetches the community builds at a fixed commit into
 `~/.cache/victory/bases`, applies the fixes for Proton in
 `scripts/bases/<name>` and builds them. Both compile their own HLSL with
 methods Wine's compiler lacks, so they need Microsoft's `d3dcompiler_47.dll`:
 copy it from a Windows install's `System32` to
 `~/.local/share/victory/d3dcompiler_47.dll`, or set `D3DCOMPILER_47` to a
-copy of it. `run.sh` gives each build its own settings (klbf-lab's for AMD,
-with late waits off as RADV needs), keeping any value already set.
+copy of it. `run.sh` gives each build its own settings (VIctory-7900XTX's
+from its `scripts/play.ps1`, klbf-lab's with late waits off as RADV needs),
+keeping any value already set.
 
 Measured in the prologue's cell on an RX 6950 XT, Series S mode, last minute
 of a run:
@@ -77,6 +81,12 @@ of a run:
 |---|---|---|
 | `klbf-lab` | 145 ms (6.9 fps) | dark, with magenta patches |
 | `victory` | 260 ms (3.9 fps) | right |
+
+In the opening scene (Lucia at the cell window), Series X mode for
+`victory-7900xtx`, Series S for `victory`: `victory-7900xtx` takes 90 to
+185 ms a frame (5 to 11 fps) with faces right, `victory` 500 to 1,700 ms
+with every character's mouth wide open. VIctory-7900XTX's author
+recommends 64 GB of RAM: on 32 GB, the title swaps.
 
 With the `victory` and `klbf-lab` builds, `run.sh` runs the title in its
 Series S mode unless `--console` is given: the title then renders at

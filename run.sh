@@ -4,8 +4,9 @@
 #   ./run.sh <game folder, or the title's exe> [more `victory run` options]
 #
 # The VIctory build depends on the graphics card, unless VICTORY_BUILD names
-# one: klbf-lab on AMD cards, fxceless's victory-fork on NVIDIA cards (the
-# fastest each in the community's rankings, built by scripts/base.sh), this
+# one: avatarmanz's VIctory-7900XTX on AMD cards, fxceless's victory-fork on
+# NVIDIA cards (the fastest each in the community's rankings, built by
+# scripts/base.sh), this
 # checkout's build ("victory") on others. This checkout's release build is
 # made first if it is missing (cargo-xwin). The title's watchdog is off
 # unless VICTORY_NO_WATCHDOG says otherwise: a world load under Wine can
@@ -51,12 +52,12 @@ gpu_vendor() {
 build="${VICTORY_BUILD:-}"
 if [[ -z "$build" ]]; then
     case "$(gpu_vendor)" in
-        amd) build=klbf-lab ;;
+        amd) build=victory-7900xtx ;;
         nvidia) build=victory-fork ;;
         *) build=victory ;;
     esac
 fi
-echo "run.sh: VIctory build: $build (VICTORY_BUILD=victory, klbf-lab or victory-fork)" >&2
+echo "run.sh: VIctory build: $build (VICTORY_BUILD=victory, victory-7900xtx, klbf-lab or victory-fork)" >&2
 
 # A variable's value unless it is set already.
 default() {
@@ -69,11 +70,6 @@ case "$build" in
         if [[ ! -f "$exe" ]]; then
             echo "run.sh: building VIctory (release) first" >&2
             (cd "$ROOT" && XWIN_ACCEPT_LICENSE=1 cargo xwin build --release -p victory --target x86_64-pc-windows-msvc)
-        fi
-        # Its BVH walks need vkd3d-proton master's dxil-spirv (Proton's
-        # recurses without end on them).
-        if [[ -z "${VICTORY_VKD3D_DIR+x}" ]] && ! "$ROOT/scripts/vkd3d-proton-master.sh" >/dev/null; then
-            echo "run.sh: vkd3d-proton master is missing (gh logged in?): pipelines may stop being made" >&2
         fi
         ;;
     klbf-lab)
@@ -91,6 +87,16 @@ case "$build" in
         default VICTORY_CARD_BUFFERS_MB 1024
         default VICTORY_RADV_WAVE32 0
         ;;
+    victory-7900xtx)
+        exe="$("$ROOT/scripts/base.sh" victory-7900xtx)"
+        # Its own settings (scripts/play.ps1 there, without -Safe).
+        for setting in TEXTURE_NO_WAIT=1 RELAY=2 WIDE_BACK=1 CARD_REHASH_RUNS=1 JOIN_COPIES=1 \
+            INDIRECT_WINDOW=1 RELAY_COPY=1 CARD_STEPS=2 INDIRECT_BATCH=2 MAP_THREADS=1 \
+            TITLE_PRIORITIES=0 CARD_AWAKE=1 SHOW_AFTER=1 AMBIENT=0.8 SKIP_PIPELINES=none \
+            THIN=1 JOIN_PARTS=8 UPLOAD_AHEAD=1; do
+            default "VICTORY_${setting%%=*}" "${setting#*=}"
+        done
+        ;;
     victory-fork)
         exe="$("$ROOT/scripts/base.sh" victory-fork)"
         ;;
@@ -104,6 +110,11 @@ if [[ "$build" != victory ]]; then
     export WINEDLLOVERRIDES="d3dcompiler_47=n,b;${WINEDLLOVERRIDES:-}"
 fi
 export VICTORY_NO_WATCHDOG="${VICTORY_NO_WATCHDOG-1}"
+# The title's BVH walks need vkd3d-proton master's dxil-spirv (Proton's
+# recurses without end on them, which stops pipelines being made).
+if [[ -z "${VICTORY_VKD3D_DIR+x}" ]] && ! "$ROOT/scripts/vkd3d-proton-master.sh" >/dev/null; then
+    echo "run.sh: vkd3d-proton master is missing (gh logged in?): pipelines may stop being made" >&2
+fi
 
 # Series S mode unless --console is given, for the builds that hand the
 # title's upscaling to AMD FidelityFX on the host: the title renders at

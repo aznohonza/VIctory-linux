@@ -28,10 +28,10 @@ scripts/proton-viewtree.sh   # once: a faster Wine server (docs/linux-proton.md)
 ```
 
 `run.sh` takes the folder holding the title's executable, or the executable
-itself. It picks the VIctory build from the graphics card: klbf-lab
-(PastiiJay) on AMD, fxceless's victory-fork on NVIDIA, this checkout's
-elsewhere, or the one `VICTORY_BUILD` names (`victory`, `klbf-lab`,
-`victory-fork`). The first run builds it (cargo-xwin then downloads the MSVC
+itself. It picks the VIctory build from the graphics card: avatarmanz's
+VIctory-7900XTX on AMD, fxceless's victory-fork on NVIDIA, this checkout's
+elsewhere, or the one `VICTORY_BUILD` names (`victory`, `victory-7900xtx`,
+`klbf-lab`, `victory-fork`). The first run builds it (cargo-xwin then downloads the MSVC
 runtime and the Windows SDK, and accepts their licence). Wine runs in a
 prefix of its own, `~/.local/share/victory/proton`, made on first use.
 
@@ -48,6 +48,10 @@ Experimental `experimental-11.0-20261112`.
   magenta patches, and 260 ms (about 4) with this checkout's build, whose
   picture is right. The opening cutscene, up to 13,000 draws a frame, is
   much slower. With Steam's Wine server, frames take about five times longer.
+- In the opening scene, VIctory-7900XTX (the build `run.sh` picks on AMD)
+  takes 90 to 185 ms a frame, about 5 to 11 frames a second, with faces
+  right; this checkout's build takes 500 to 1,700 ms and opens every
+  character's mouth wide.
 - This checkout's build draws and lights the world, without ray-traced
   shadows or reflections, as upstream. On AMD cards this needs RADV's waves
   of 32 lanes, which the scripts ask for.
@@ -64,7 +68,9 @@ Experimental `experimental-11.0-20261112`.
 - `scripts/proton-viewtree.sh`, which builds Proton's Wine server with a
   process's memory views in a tree: world frames about five times faster.
 - `scripts/base.sh`, which builds the community's fastest VIctory for the
-  card (klbf-lab, fxceless's victory-fork) with fixes for Proton.
+  card (VIctory-7900XTX, fxceless's victory-fork) with fixes for Proton.
+- `scripts/vkd3d-proton-master.sh`, which fetches vkd3d-proton master for
+  its dxil-spirv fix.
 - Fixes for Wine and vkd3d-proton: VIctory's own shaders build with Wine's
   HLSL compiler, an empty pipeline library is asked for with a null blob,
   each translated program returns from one block (dxil-spirv cannot
