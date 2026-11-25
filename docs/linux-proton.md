@@ -137,6 +137,20 @@ only its sky, and faces lose details. Both scripts add `gewave32,pswave32` to
 klbf-lab, which splits its own ballots for waves of 64 and draws wrong in
 waves of 32.
 
+### vkd3d-proton master
+
+The dxil-spirv (vkd3d-proton's DXIL to SPIR-V translation) of Proton
+Experimental 11.0-20261112 recurses without end on some of the title's
+programs (its BVH walks), and the stack overflow ends the thread making
+pipelines: no new pipeline is made after it. dxil-spirv fixed it (its pull
+request #371, in vkd3d-proton master since 2026-11-23).
+`scripts/vkd3d-proton-master.sh` downloads vkd3d-proton master's newest
+package from its CI into `~/.local/share/victory/vkd3d-proton` (it needs the
+GitHub CLI, logged in), and `run.sh` runs it for this checkout's build.
+`proton-run.sh` then puts its `d3d12.dll` and `d3d12core.dll` next to the
+exe, where Wine looks first. `VICTORY_VKD3D_DIR` names another folder, and
+an empty one keeps Proton's.
+
 ### A faster Wine server
 
 The title maps and unmaps thousands of memory views a frame. Wine's server

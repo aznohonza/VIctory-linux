@@ -70,6 +70,11 @@ case "$build" in
             echo "run.sh: building VIctory (release) first" >&2
             (cd "$ROOT" && XWIN_ACCEPT_LICENSE=1 cargo xwin build --release -p victory --target x86_64-pc-windows-msvc)
         fi
+        # Its BVH walks need vkd3d-proton master's dxil-spirv (Proton's
+        # recurses without end on them).
+        if [[ -z "${VICTORY_VKD3D_DIR+x}" ]] && ! "$ROOT/scripts/vkd3d-proton-master.sh" >/dev/null; then
+            echo "run.sh: vkd3d-proton master is missing (gh logged in?): pipelines may stop being made" >&2
+        fi
         ;;
     klbf-lab)
         exe="$("$ROOT/scripts/base.sh" klbf-lab)"

@@ -16,6 +16,9 @@
 #                from Steam)
 #   PREFIX       the Proton prefix to use (default: ~/.local/share/victory/proton)
 #   VICTORY_EXE  the exe to run (default: this checkout's release build)
+#   VICTORY_VKD3D_DIR  a folder with another vkd3d-proton's d3d12.dll and
+#                d3d12core.dll (default: the one scripts/vkd3d-proton-master.sh
+#                fills, when it exists; empty: Proton's own)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -94,9 +97,22 @@ fi
 
 WINE="$PROTON/files/bin/wine"
 if [[ -n "${VICTORY_EXE:-}" ]]; then
-    exec "$WINE" "$VICTORY_EXE" "$@"
-elif [[ "${1:-}" == *.exe && -f "${1:-}" ]]; then
-    exec "$WINE" "$@"
-else
-    exec "$WINE" "$ROOT/target/x86_64-pc-windows-msvc/release/victory.exe" "$@"
+    set -- "$VICTORY_EXE" "$@"
+elif [[ "${1:-}" != *.exe || ! -f "${1:-}" ]]; then
+    set -- "$ROOT/target/x86_64-pc-windows-msvc/release/victory.exe" "$@"
 fi
+
+# Another vkd3d-proton (scripts/vkd3d-proton-master.sh), put next to the exe,
+# where Wine looks first: VICTORY_VKD3D_DIR, else the folder that script
+# fills when it exists. A copy left there earlier goes when neither is set.
+vkd3d="${VICTORY_VKD3D_DIR-${XDG_DATA_HOME:-$HOME/.local/share}/victory/vkd3d-proton}"
+here="$(dirname "$1")"
+if [[ -n "$vkd3d" && -f "$vkd3d/d3d12core.dll" ]]; then
+    for dll in d3d12.dll d3d12core.dll; do
+        cmp -s "$vkd3d/$dll" "$here/$dll" || install -m 644 "$vkd3d/$dll" "$here/"
+    done
+    echo "$vkd3d" >"$here/.vkd3d-proton"
+elif [[ -f "$here/.vkd3d-proton" ]]; then
+    rm -f "${here:?}/d3d12.dll" "${here:?}/d3d12core.dll" "${here:?}/.vkd3d-proton"
+fi
+exec "$WINE" "$@"
