@@ -723,6 +723,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    if let Some(state) = crate::hooks::pool_state(at) {
+        line(state);
+    }
     if to_file {
         let end = report_end();
         eprint!("{end}");
