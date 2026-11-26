@@ -1704,17 +1704,29 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
-        // Free space in the heaps of textures takes the card's memory but
-        // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget {
-            ((used - BUDGET_LOW * budget) * 1e6) as u64
-        } else {
-            0
-        }
+    let over = crate::host::video_memory().map_or(0, |[(used, budget), (shared, _)]| {
+        to_give_up(used, shared, crate::placement::free_bytes() as f64 / 1e6, budget)
     });
     evict(frame, now_ms(), over);
+}
+
+/// Bytes of host textures to give up with `used` MB of the card's own memory
+/// of `budget`, `shared` MB more the driver moved into the PC's memory, and
+/// `free` MB of heap space no texture uses yet: the ones past [`BUDGET_HIGH`]
+/// of the card's budget, until back under [`BUDGET_LOW`].
+///
+/// The PC's memory counts: past the card's own the driver moves what does not
+/// fit into host RAM, which the card's budget does not bound. It stood at
+/// 3,900 to 5,700 MB there, still climbing, while the card's own use sat under
+/// nine tenths of its budget and nothing was given up (2026-11-26, RTX 3060,
+/// 31 GB, no swap: the process held 22 GB and the machine ran out).
+fn to_give_up(used: f64, shared: f64, free: f64, budget: f64) -> u64 {
+    let used = used + shared - free;
+    if used > BUDGET_HIGH * budget {
+        ((used - BUDGET_LOW * budget) * 1e6) as u64
+    } else {
+        0
+    }
 }
 
 /// A host texture and the title textures (resource objects) holding it.
@@ -2439,6 +2451,18 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_the_driver_moved_into_the_pcs_counts_to_give_up() {
+        // 6,000 of a 11,500 MB budget and 3,900 MB of the PC's: 9,900 is
+        // under nine tenths (10,350), nothing given up.
+        assert_eq!(to_give_up(6000.0, 3900.0, 0.0, 11500.0), 0);
+        // 7,267 and 5,719 of a 11,409 MB budget (a world load's reading):
+        // 12,986 past 10,268, so back to 9,698: 3,288 MB.
+        assert_eq!(to_give_up(7267.0, 5719.0, 0.0, 11409.0) / 1_000_000, 3288);
+        // Free heap space no texture uses yet takes 500 MB off that.
+        assert_eq!(to_give_up(6000.0, 1000.0, 500.0, 7000.0) / 1_000_000, 550);
+    }
 
     #[test]
     fn a_regions_rows_in_a_footprint() {
