@@ -1,0 +1,700 @@
+Wine fixes for the cool_fox-main build (Proton, vkd3d-proton, NVIDIA):
+the indirect clamp and the ambient stand-in are compiled at run time with
+Wine's d3dcompiler, which has no ByteAddressBuffer methods, no interlocked
+methods on resources and drops [RootSignature]. The clamp is rewritten to
+structured buffers and one walking group, root signatures are made in
+host::compute_root, and isnan/isinf are replaced. Also the two fixes the
+linux run.sh applies to fxceless's fork (empty pipeline library blob,
+Wine's ws2_32 has no WSAConnectByList/GetAddrInfoExA).
+
+Apply with:  patch -p1 -d cool_fox-main < cool-fox-wine.patch
+
+--- a/crates/victory-gpu/src/ambient.rs
++++ b/crates/victory-gpu/src/ambient.rs
+@@ -166,7 +166,7 @@
+     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
+         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
+         float3 c = max(radiance[p], 0.0);
+-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
++        c = any(c != c) || any(abs(c) > 3.402823466e38) ? 0.0 : c;
+         // Lamps and glints count, but not for everything.
+         sum += c / max(1.0, dot(c, LUMA) / 20.0);
+     }
+@@ -356,11 +356,18 @@
+     let mut root: Option<ID3D12RootSignature> = None;
+     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
+         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+-        // SAFETY: the root signature is inside the shader; plain creations.
++        // The root signature is made here: Wine's HLSL compiler drops the
++        // `[RootSignature]` attribute and embeds none.
++        if root.is_none() {
++            use crate::host::RootView::{TableSrv, TableUav, Uav};
++            root = Some(crate::host::compute_root(
++                device,
++                12,
++                &[(TableSrv, 0), (TableUav, 0), (Uav, 1), (Uav, 2)],
++            )?);
++        }
++        // SAFETY: plain creations with a root signature that outlives them.
+         unsafe {
+-            if root.is_none() {
+-                root = Some(device.CreateRootSignature(0, &code)?);
+-            }
+             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                 pRootSignature: std::mem::transmute_copy(&root),
+                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1399,6 +1399,112 @@
+     Ok(bytes.to_vec())
+ }
+ 
++/// A root view of a shader of ours ([`compute_root`]).
++#[derive(Clone, Copy)]
++pub(crate) enum RootView {
++    Srv,
++    Uav,
++    /// A one-view descriptor table at this register (the table itself is
++    /// bound by the caller, as the title's views are).
++    TableSrv,
++    TableUav,
++}
++
++/// The root signature of a compute shader of ours: `constants` root
++/// constants at b0, then `views` (kind and register), in that order. Made
++/// here rather than read from the shader: Wine's HLSL compiler drops
++/// `[RootSignature]` and embeds none.
++pub(crate) fn compute_root(
++    device: &ID3D12Device,
++    constants: u32,
++    views: &[(RootView, u32)],
++) -> windows::core::Result<ID3D12RootSignature> {
++    let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
++    // The ranges a table parameter points at, alive through the call.
++    let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
++    if constants > 0 {
++        params.push(D3D12_ROOT_PARAMETER1 {
++            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
++            Anonymous: D3D12_ROOT_PARAMETER1_0 {
++                Constants: D3D12_ROOT_CONSTANTS {
++                    ShaderRegister: 0,
++                    RegisterSpace: 0,
++                    Num32BitValues: constants,
++                },
++            },
++            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
++        });
++    }
++    for &(kind, register) in views {
++        let uav = matches!(kind, RootView::Uav | RootView::TableUav);
++        let param = match kind {
++            RootView::Srv | RootView::Uav => D3D12_ROOT_PARAMETER1 {
++                ParameterType: if uav {
++                    D3D12_ROOT_PARAMETER_TYPE_UAV
++                } else {
++                    D3D12_ROOT_PARAMETER_TYPE_SRV
++                },
++                Anonymous: D3D12_ROOT_PARAMETER1_0 {
++                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
++                        ShaderRegister: register,
++                        RegisterSpace: 0,
++                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
++                    },
++                },
++                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
++            },
++            RootView::TableSrv | RootView::TableUav => {
++                ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
++                    RangeType: if uav {
++                        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
++                    } else {
++                        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
++                    },
++                    NumDescriptors: 1,
++                    BaseShaderRegister: register,
++                    RegisterSpace: 0,
++                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
++                    OffsetInDescriptorsFromTableStart: 0,
++                }));
++                let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last().expect("just pushed");
++                D3D12_ROOT_PARAMETER1 {
++                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
++                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
++                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
++                            NumDescriptorRanges: 1,
++                            pDescriptorRanges: range,
++                        },
++                    },
++                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
++                }
++            }
++        };
++        params.push(param);
++    }
++    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
++        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
++        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
++            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
++                NumParameters: params.len() as u32,
++                pParameters: params.as_ptr(),
++                NumStaticSamplers: 0,
++                pStaticSamplers: std::ptr::null(),
++                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
++            },
++        },
++    };
++    // SAFETY: the description points at live arrays; the blob is read in
++    // full before it is released.
++    unsafe {
++        let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
++        D3D12SerializeVersionedRootSignature(&desc, &mut blob, None)?;
++        let blob = blob.ok_or_else(windows::core::Error::empty)?;
++        let bytes =
++            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
++        device.CreateRootSignature(0, bytes)
++    }
++}
++
+ impl PlanePass {
+     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
+     /// or of floats and the depth format `format`.
+--- a/crates/victory-gpu/src/indirect.rs
++++ b/crates/victory-gpu/src/indirect.rs
+@@ -43,7 +43,6 @@
+ pub(crate) mod batch;
+ 
+ const SOURCE: &str = r#"
+-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+ cbuffer Record : register(b0) {
+     uint kind;
+     uint stride;
+@@ -55,177 +54,143 @@
+     uint has_count;
+     uint count_offset;
+ };
+-ByteAddressBuffer src_args : register(t0);
+-ByteAddressBuffer count_buf : register(t1);
+-RWByteAddressBuffer dst_args : register(u0);
+-// The list's work so far (vertex instances, threads): past the budget,
+-// records run empty.
+-RWByteAddressBuffer budget : register(u1);
++// Wine's d3dcompiler has no ByteAddressBuffer methods and no
++// InterlockedCompareExchange on resources, so the words are read and
++// written as a structured buffer's and one group walks all records:
++// records are 4-byte words here, offsets in bytes.
++StructuredBuffer<uint> src_args : register(t0);
++StructuredBuffer<uint> count_buf : register(t1);
++RWStructuredBuffer<uint> dst_args : register(u0);
++// [0] the list's work so far (vertex instances, threads), then the
++// diagnostics words [1] largest mesh group count, [2] groups in all,
++// [3] records refused for want of budget, [4] the largest cost.
++RWStructuredBuffer<uint> budget : register(u1);
+ static const uint BUDGET = 1u << 27;
+ // The vertices or indices an instance from which a draw record runs empty.
+ static const uint MOST_DRAW = 1u << 23;
+ // Groups of one dispatch; more run empty.
+ static const uint GROUPS = 1u << 20;
+-// Each group charges the budget once: the costs of its records go here,
+-// one thread charges their sum, saturating as each record would in lane
+-// order, and every thread then reads whether its own record fitted. A
+-// compare and swap per record, 64 threads racing for one word, cost a
+-// round for each record of a window, and in memory the CPU maps (where the
+-// budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
+-// crosses the bus on a card of its own.
+ groupshared uint costs[64];
+ groupshared uint fits[64];
+-groupshared uint largest_asked;
+-groupshared uint all_asked;
+-[RootSignature(RS)]
+ [numthreads(64, 1, 1)]
+-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
++void main(uint gi : SV_GroupIndex) {
+     uint eff_count = records;
+     bool ahead = (has_count & 2u) != 0;
+     if ((has_count & 1u) != 0) {
+-        eff_count = min(eff_count, count_buf.Load(count_offset));
+-    }
+-    // Threads past the records take part in the group's charge (cost 0)
+-    // and store nothing.
+-    bool active = id.x < eff_count;
+-    uint src_at = args_offset + id.x * stride;
+-    uint dst_at = id.x * stride;
+-    uint cost = 0;
+-    uint asked = 0;
+-    uint2 draw_counts = uint2(0, 0);
+-    uint3 groups = uint3(0, 0, 0);
+-    if (gi == 0) {
+-        largest_asked = 0;
+-        all_asked = 0;
++        eff_count = min(eff_count, count_buf[count_offset >> 2]);
+     }
+-    if (active && kind <= 1) {
+-        // Draws: vertex or index count, then instances.
+-        uint2 want = src_args.Load2(src_at);
+-        if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
+-            want = uint2(0, 0);
+-        }
+-        // A record of MOST_DRAW vertices or indices an instance, or more, is
+-        // no draw of the title's (a slot it has not filled): it runs empty
+-        // and charges nothing (victory-fork f85101b6, its window checker
+-        // found 90 of 2^24 vertices in one list).
+-        if (want.x >= MOST_DRAW) {
+-            want = uint2(0, 0);
+-        }
+-        uint count = want.x;
+-        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+-        cost = count * instances;
+-        draw_counts = uint2(count, instances);
+-    } else if (active && kind == 2) {
+-        uint3 g = src_args.Load3(src_at);
+-        // Up to WIDEST groups in x run as asked (`widest`).
+-        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+-        // x * y fits 32 bits where it is looked at; the whole count may not.
+-        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+-            g = uint3(0, 0, 0);
+-        }
+-        cost = g.x * g.y * g.z * 64u;
+-        groups = g;
+-    } else if (active) {
+-        // Mesh dispatches: the console's are one-dimensional.
+-        uint3 g = src_args.Load3(src_at);
+-        // A record over the most a dispatch runs is a slot the title has
+-        // not filled (the title leaves all ones there): empty,
+-        // and not counted below either. (65,535 groups of meshlets read
+-        // through the garbage beside it read past every buffer.)
+-        if (g.x > 65535u) {
+-            g = uint3(0, 0, 0);
+-        }
+-        asked = g.x;
+-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+-        cost = g.x * g.y * g.z * 128u;
+-        groups = g;
+-    }
+-    costs[gi] = cost;
+-    GroupMemoryBarrierWithGroupSync();
+-    if (active && kind > 2) {
+-        // Diagnostics, in the budget buffer's next words (below): the
+-        // largest group count a mesh record asked for, and the groups
+-        // asked in all.
+-        uint was;
+-        InterlockedMax(largest_asked, asked, was);
+-        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
++    // One group charges the budget as it goes, in tile and lane order, so
++    // no two groups race for it and no atomic is needed.
++    uint at = min(budget[0], BUDGET);
++    uint refused = 0;
++    uint biggest = 0;
++    uint largest_asked = 0;
++    uint all_asked = 0;
++    uint tiles = (eff_count + 63u) / 64u;
++    for (uint tile = 0; tile < tiles; tile++) {
++        uint record = tile * 64u + gi;
++        bool active = record < eff_count;
++        uint src_at = args_offset + record * stride;
++        uint dst_at = record * stride;
++        uint cost = 0;
++        uint asked = 0;
++        uint2 draw_counts = uint2(0, 0);
++        uint3 groups = uint3(0, 0, 0);
++        if (active && kind <= 1) {
++            // Draws: vertex or index count, then instances.
++            uint2 want = uint2(src_args[src_at >> 2], src_args[(src_at >> 2) + 1]);
++            if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
++                want = uint2(0, 0);
++            }
++            // A record of MOST_DRAW vertices or indices an instance, or
++            // more, is no draw of the title's (a slot it has not filled):
++            // it runs empty and charges nothing.
++            if (want.x >= MOST_DRAW) {
++                want = uint2(0, 0);
++            }
++            uint count = want.x;
++            uint instances = min(want.y, (1u << 26) / max(count, 1u));
++            cost = count * instances;
++            draw_counts = uint2(count, instances);
++        } else if (active && kind == 2) {
++            uint3 g = uint3(src_args[src_at >> 2], src_args[(src_at >> 2) + 1], src_args[(src_at >> 2) + 2]);
++            // Up to WIDEST groups in x run as asked (`widest`).
++            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
++            // x * y fits 32 bits where it is looked at; the whole count
++            // may not.
++            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
++                g = uint3(0, 0, 0);
++            }
++            cost = g.x * g.y * g.z * 64u;
++            groups = g;
++        } else if (active) {
++            // Mesh dispatches: the console's are one-dimensional.
++            uint3 g = uint3(src_args[src_at >> 2], src_args[(src_at >> 2) + 1], src_args[(src_at >> 2) + 2]);
++            // A record over the most a dispatch runs is a slot the title
++            // has not filled (it leaves all ones there): empty, and not
++            // counted below either.
++            if (g.x > 65535u) {
++                g = uint3(0, 0, 0);
++            }
++            asked = g.x;
++            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
++            cost = g.x * g.y * g.z * 128u;
++            groups = g;
++        }
++        costs[gi] = cost;
++        GroupMemoryBarrierWithGroupSync();
++        if (gi == 0) {
++            for (uint k = 0; k < 64u; k++) {
++                uint c = costs[k];
++                uint fit = 1;
++                if (c > 0) {
++                    fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
++                    at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
++                    refused += 1u - fit;
++                    biggest = max(biggest, c);
++                }
++                fits[k] = fit;
++            }
++            largest_asked = max(largest_asked, asked);
++            all_asked = min(all_asked + asked, 1u << 24);
++        }
++        GroupMemoryBarrierWithGroupSync();
++        if (!active) {
++            continue;
++        }
++        bool over = fits[gi] == 0;
++        if (kind <= 1) {
++            if (over) {
++                draw_counts = uint2(0, 0);
++            }
++            dst_args[dst_at >> 2] = draw_counts.x;
++            dst_args[(dst_at >> 2) + 1] = draw_counts.y;
++            for (uint off = 8u; off < stride; off += 4u) {
++                dst_args[(dst_at + off) >> 2] = src_args[(src_at + off) >> 2];
++            }
++        } else {
++            if (over) {
++                groups = uint3(0, 0, 0);
++            }
++            dst_args[dst_at >> 2] = groups.x;
++            dst_args[(dst_at >> 2) + 1] = groups.y;
++            dst_args[(dst_at >> 2) + 2] = groups.z;
++            for (uint off = 12u; off < stride; off += 4u) {
++                dst_args[(dst_at + off) >> 2] = src_args[(src_at + off) >> 2];
++            }
++        }
+     }
+-    // The group's own records: none for a group past a count buffer's
+-    // count (an execution may ask for thousands and count a few), which
+-    // touches the budget not at all, as its threads did not before.
+-    uint first = id.x - gi;
+-    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+-    if (gi == 0 && n > 0) {
+-        // What the records charge, from `before` on, in lane order: a
+-        // record that does not fit whole runs empty and takes the rest
+-        // (`rest`).
+-        // Only the group's own records are walked (one, clamped alone).
+-        uint before;
+-        budget.InterlockedOr(0, 0, before);
+-        [allow_uav_condition]
+-        while (before < BUDGET) {
+-            uint next = before;
+-            for (uint j = 0; j < n; j++) {
+-                uint c = costs[j];
+-                if (c > 0 && next < BUDGET) {
+-                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+-                }
+-            }
+-            if (next == before) break;
+-            uint prev;
+-            budget.InterlockedCompareExchange(0, before, next, prev);
+-            if (prev == before) break;
+-            before = prev;
+-        }
+-        uint at = before;
+-        uint refused = 0;
+-        uint biggest = 0;
+-        for (uint k = 0; k < n; k++) {
+-            uint c = costs[k];
+-            uint fit = 1;
+-            if (c > 0) {
+-                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+-                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+-                refused += 1 - fit;
+-                biggest = max(biggest, c);
+-            }
+-            fits[k] = fit;
+-        }
+-        // Diagnostics: the records that run empty for want of budget, and
+-        // the largest cost there was (small ones are not told).
+-        uint told;
++    if (gi == 0) {
++        budget[0] = at;
+         if (refused > 0) {
+-            budget.InterlockedAdd(12, refused, told);
++            budget[3] = budget[3] + refused;
+         }
+         if (biggest >= (1u << 22)) {
+-            budget.InterlockedMax(16, biggest, told);
++            budget[4] = max(budget[4], biggest);
+         }
+-    }
+-    GroupMemoryBarrierWithGroupSync();
+-    if (gi == 0 && kind > 2 && n > 0) {
+-        uint was;
+-        budget.InterlockedMax(4, largest_asked, was);
+-        budget.InterlockedAdd(8, all_asked, was);
+-    }
+-    if (!active) {
+-        return;
+-    }
+-    bool over = fits[gi] == 0;
+-    if (kind <= 1) {
+-        if (over) {
+-            draw_counts = uint2(0, 0);
+-        }
+-        dst_args.Store2(dst_at, draw_counts);
+-        for (uint off = 8; off < stride; off += 4) {
+-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+-        }
+-    } else {
+-        if (over) {
+-            groups = uint3(0, 0, 0);
+-        }
+-        dst_args.Store3(dst_at, groups);
+-        for (uint off = 12; off < stride; off += 4) {
+-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
++        if (kind > 2) {
++            budget[1] = max(budget[1], largest_asked);
++            budget[2] = budget[2] + all_asked;
+         }
+     }
+ }
+@@ -260,7 +225,25 @@
+ }
+ 
+ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+-    make_from(device, SOURCE)
++    make_from(device, SOURCE, clamp_root(device))
++}
++
++/// The main clamp's root signature: its 6 root constants, the title's
++/// arguments and count, the clamped ones and the budget.
++fn clamp_root(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
++    use crate::host::RootView::{Srv, Uav};
++    crate::host::compute_root(device, 6, &[(Srv, 0), (Srv, 1), (Uav, 0), (Uav, 1)])
++}
++
++/// The batched clamp's: the four sources, the jobs, the clamped records and
++/// the budget (its counts come from the jobs buffer).
++fn batch_root(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
++    use crate::host::RootView::{Srv, Uav};
++    crate::host::compute_root(
++        device,
++        0,
++        &[(Srv, 0), (Srv, 1), (Srv, 2), (Srv, 3), (Srv, 4), (Uav, 0), (Uav, 1)],
++    )
+ }
+ 
+ /// The most groups in x that an indirect dispatch runs as the title asks:
+@@ -303,7 +286,11 @@
+ 
+ /// The clamp compiled from `source` (ours, or in the benchmark the one it
+ /// replaced).
+-fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
++fn make_from(
++    device: &ID3D12Device,
++    source: &str,
++    root: windows::core::Result<ID3D12RootSignature>,
++) -> windows::core::Result<Clamp> {
+     #[cfg(feature = "diagnostics")]
+     let batched = source == batch::SOURCE;
+     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+@@ -339,11 +326,13 @@
+         return Err(e);
+     }
+     let code = code.ok_or_else(windows::core::Error::empty)?;
+-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
++    // A root signature made here, not the shader's: Wine's compiler drops
++    // the `[RootSignature]` attribute and embeds none.
++    let root = root?;
++    // SAFETY: the blob's own bytes; the root signature is ours and alive.
+     unsafe {
+         let bytes =
+             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+             pRootSignature: std::mem::transmute_copy(&root),
+             CS: D3D12_SHADER_BYTECODE {
+@@ -544,7 +533,9 @@
+             l.SetComputeRootShaderResourceView(2, count_gpu);
+             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+             l.SetComputeRootUnorderedAccessView(4, budget);
+-            l.Dispatch(records.div_ceil(64), 1, 1);
++            // One group walks every tile of records (Wine's compiler has no
++            // atomics on resources); `records` is the clamp's own loop count.
++            l.Dispatch(1, 1, 1);
+         }
+         l.ResourceBarrier(&second[skip..]);
+     }
+@@ -556,7 +547,7 @@
+     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+     CLAMP
+         .get_or_init(|| {
+-            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE));
++            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE, batch_root(&h.device)));
+             match made {
+                 Ok(c) => Some(c),
+                 Err(e) => {
+@@ -612,7 +603,7 @@
+ /// replayer.
+ #[cfg(feature = "diagnostics")]
+ pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+-    make_from(device, batch::SOURCE).map(|c| (c.root, c.pso))
++    make_from(device, batch::SOURCE, batch_root(device)).map(|c| (c.root, c.pso))
+ }
+ 
+ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+@@ -2606,7 +2597,7 @@
+     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
+         let mut warp = WarpHarness::new()?;
+         let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+-        let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
++        let clamp = make_from(&warp.device, &source, clamp_root(&warp.device)).expect("the clamp must compile on WARP");
+         const KIND_DRAW: u32 = 0;
+         const STRIDE: u32 = 16;
+         const BUDGET_CAP: u32 = 1 << 27;
+@@ -2983,7 +2974,7 @@
+             return;
+         }
+         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+-        let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
++        let pass = make_from(&gpu.device, batch::SOURCE, batch_root(&gpu.device)).expect("the batched clamp must compile");
+         let sig = gpu.signature(2, 12);
+         for asked in [67_440u32, 115_200, 1 << 20, (1 << 20) + 1] {
+             let runs = if asked > 1 << 20 { 65_535 } else { asked };
+@@ -3071,7 +3062,7 @@
+         let Some(mut warp) = WarpHarness::new() else {
+             return;
+         };
+-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
++        let pass = make_from(&warp.device, batch::SOURCE, batch_root(&warp.device)).expect("the batched clamp must compile on WARP");
+         let kinds = [0u32, 1, 2, 10];
+         let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 26) + 1, u32::MAX];
+         // Every kind with many records, in two sources.
+@@ -3152,7 +3143,7 @@
+         let Some(mut warp) = WarpHarness::new() else {
+             return;
+         };
+-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
++        let pass = make_from(&warp.device, batch::SOURCE, batch_root(&warp.device)).expect("the batched clamp must compile on WARP");
+         const BUDGET: u32 = 1 << 27;
+         // 2^26 vertices each, as much as a draw is let run: two fill it.
+         for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+@@ -3272,7 +3263,7 @@
+             return;
+         };
+         const EXECUTIONS: u32 = 2355;
+-        let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
++        let pass = make_from(&gpu.device, batch::SOURCE, batch_root(&gpu.device)).expect("the batched clamp must compile");
+         let sig = gpu.signature(2, 12);
+         let groups: Vec<u32> = vec![1; 2048];
+         let src = dispatch_records(&gpu, &groups, 32);
+--- a/crates/victory-gpu/src/indirect/batch.rs
++++ b/crates/victory-gpu/src/indirect/batch.rs
+@@ -117,7 +117,7 @@
+     uint n = count > first ? min(64u, count - first) : 0u;
+     if (gi == 0 && n > 0) {
+         uint before;
+-        budget.InterlockedOr(0, 0, before);
++        before = budget.Load(0);
+         [allow_uav_condition]
+         while (before < BUDGET) {
+             uint next = before;
+--- a/crates/victory-gpu/src/pipeline/library.rs
++++ b/crates/victory-gpu/src/pipeline/library.rs
+@@ -461,10 +461,23 @@
+ /// adapter or driver change, damage).
+ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+-        // SAFETY: the bytes outlive the library (kept beside it).
++        // An empty library is asked for with a null blob: an empty slice's
++        // pointer is dangling, which vkd3d-proton (Proton) rejects.
++        let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr() };
++        let mut library: Option<ID3D12PipelineLibrary> = None;
++        // SAFETY: the bytes outlive the library (kept beside it); the out
++        // pointer is ours and typed by the interface id passed with it.
+         unsafe {
+-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
++            (Interface::vtable(device).CreatePipelineLibrary)(
++                Interface::as_raw(device),
++                data.cast(),
++                bytes.len(),
++                &ID3D12PipelineLibrary::IID,
++                (&raw mut library).cast(),
++            )
++            .ok()?;
+         }
++        library.ok_or_else(windows::core::Error::empty)?.cast()
+     };
+     if !blob.bytes().is_empty() {
+         match make(blob.bytes()) {
+--- a/crates/victory-hle/src/modules/net.rs
++++ b/crates/victory-hle/src/modules/net.rs
+@@ -320,9 +320,18 @@
+             return 0;
+         }
+     }
+-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
+-        s, list, local_len, local, remote_len, remote, timeout, reserved,
+-    )
++    type ConnectByList = extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32;
++    static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
++    // Wine's ws2_32 has no WSAConnectByList: fail the call as unsupported.
++    let Some(address) = *ADDRESS.get_or_init(|| crate::host::function("ws2_32.dll", "WSAConnectByList"))
++    else {
++        const WSAEOPNOTSUPP: i32 = 10045;
++        host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32))(WSAEOPNOTSUPP);
++        return 0;
++    };
++    // SAFETY: the host exports this function with this signature.
++    let connect = unsafe { std::mem::transmute::<usize, ConnectByList>(address) };
++    connect(s, list, local_len, local, remote_len, remote, timeout, reserved)
+ }
+ 
+ pub extern "system" fn WSAJoinLeaf(
+@@ -588,9 +597,16 @@
+     if !resolvable(narrow(name)) {
+         return blocked_lookup(result);
+     }
+-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+-        name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
+-    )
++    type Resolve = extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32;
++    static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
++    // Wine's ws2_32 has no GetAddrInfoExA: the name is not found.
++    let Some(address) = *ADDRESS.get_or_init(|| crate::host::function("ws2_32.dll", "GetAddrInfoExA"))
++    else {
++        return WSAHOST_NOT_FOUND;
++    };
++    // SAFETY: the host exports this function with this signature.
++    let resolve = unsafe { std::mem::transmute::<usize, Resolve>(address) };
++    resolve(name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle)
+ }
+ 
+ pub extern "system" fn GetAddrInfoExW(
+@@ -1106,6 +1122,9 @@
+         // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
+         // them only when the host really lacks them.
+         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
++        // Wine's ws2_32 lacks these; their overrides fail the call instead
++        // of forwarding it.
++        const MISSING_ON_WINE: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
+         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
+             let dll = if e.name.starts_with("WinHttp") {
+                 "winhttp.dll"
+@@ -1113,7 +1132,7 @@
+                 "ws2_32.dll"
+             };
+             let present = crate::host::function(dll, e.name).is_some();
+-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
++            if !present && (NEWER_WINDOWS_ONLY.contains(&e.name) || MISSING_ON_WINE.contains(&e.name)) {
+                 continue;
+             }
+             assert!(present, "{dll} lacks {}", e.name);
